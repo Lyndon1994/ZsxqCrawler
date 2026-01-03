@@ -1671,6 +1671,10 @@ def main():
     parser = argparse.ArgumentParser(description='知识星球交互式数据采集器')
     parser.add_argument('-d', '--auto-download', action='store_true',
                         help='自动下载模式：按时间排序下载最近3天的文件，无需交互')
+    parser.add_argument('--send-email', action='store_true',
+                        help='自动下载模式下，下载完成后自动总结PDF并发送邮件')
+    parser.add_argument('--email-after-time', type=float, default=None,
+                        help='只处理N天之前到现在的PDF文件（支持小数，如0.5表示12小时），默认只处理本次下载的文件')
     args = parser.parse_args()
     
     # 加载配置信息
@@ -1709,6 +1713,25 @@ def main():
         print("🔄 按时间排序收集文件列表...")
         downloader.collect_files_by_time()
         
+        # 获取下载目录路径
+        from db_path_manager import get_db_path_manager
+        path_manager = get_db_path_manager()
+        group_dir = path_manager.get_group_dir(GROUP_ID)
+        download_dir = os.path.join(group_dir, "downloads")
+        
+        # 记录当前时间，用于后续筛选新下载的文件
+        # 可以通过命令行参数指定天数，默认为下载开始时间（只处理新下载的）
+        if args.email_after_time is not None:
+            # 将天数转换为时间戳（当前时间 - N天）
+            import datetime
+            days_ago = args.email_after_time
+            download_start_time = time.time() - (days_ago * 24 * 3600)
+            timestamp_str = datetime.datetime.fromtimestamp(download_start_time).strftime('%Y-%m-%d %H:%M:%S')
+            print(f"📅 只处理 {days_ago} 天内的PDF文件（{timestamp_str} 之后）")
+        else:
+            # 默认使用下载开始时间
+            download_start_time = time.time()
+        
         # 自动下载最近3天的文件
         print("\n🚀 开始下载最近3天的文件...")
         downloader.download_files_from_database(
@@ -1719,6 +1742,63 @@ def main():
         )
         
         print("\n✅ 自动下载任务完成！")
+        
+        # 如果开启了邮件发送功能
+        if args.send_email:
+            print("\n📧 开始处理新下载的PDF文件并发送邮件...")
+            print("=" * 60)
+            
+            try:
+                from pdf_summarizer import PDFSummarizer
+                
+                # 检查必要配置
+                if not config.get('azure_openai', {}).get('api_key'):
+                    print("❌ 请先在config.toml中配置Azure OpenAI API密钥")
+                    return
+                
+                if not config.get('email', {}).get('sender_email'):
+                    print("❌ 请先在config.toml中配置邮件发送信息")
+                    return
+                
+                # 创建PDF总结器
+                summarizer = PDFSummarizer(config)
+                
+                if os.path.exists(download_dir):
+                    # 只处理本次下载后创建/修改的PDF文件（文件修改时间晚于下载开始时间）
+                    new_pdf_files = []
+                    for file in os.listdir(download_dir):
+                        if file.lower().endswith('.pdf'):
+                            file_path = os.path.join(download_dir, file)
+                            # 检查文件修改时间是否在下载开始之后
+                            if os.path.getmtime(file_path) >= download_start_time:
+                                new_pdf_files.append(file_path)
+                    
+                    if new_pdf_files:
+                        print(f"📚 找到 {len(new_pdf_files)} 个新下载的PDF文件")
+                        
+                        # 处理每个PDF
+                        success_count = 0
+                        for i, pdf_path in enumerate(new_pdf_files, 1):
+                            print(f"\n进度: [{i}/{len(new_pdf_files)}]")
+                            try:
+                                if summarizer.process_pdf(pdf_path, send_email=True):
+                                    success_count += 1
+                                # 添加延迟避免API调用过快
+                                if i < len(new_pdf_files):
+                                    time.sleep(2)
+                            except Exception as e:
+                                print(f"❌ 处理失败: {e}")
+                        
+                        print(f"\n📊 邮件发送完成: 成功 {success_count}/{len(new_pdf_files)}")
+                    else:
+                        print("⚠️ 本次没有新下载的PDF文件")
+                else:
+                    print(f"⚠️ 下载目录不存在: {download_dir}")
+                    
+            except ImportError:
+                print("❌ 无法导入pdf_summarizer模块，请确保文件存在")
+            except Exception as e:
+                print(f"❌ 邮件发送过程出错: {e}")
     else:
         # 运行交互界面
         crawler.run_interactive()
